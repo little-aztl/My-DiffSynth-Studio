@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Tuple, Optional, Callable
+from typing import Tuple, Optional
 from einops import rearrange
 from .utils import hash_state_dict_keys
 try:
@@ -165,7 +165,7 @@ class CrossAttention(nn.Module):
 
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, freqs = None):
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
@@ -173,8 +173,6 @@ class CrossAttention(nn.Module):
             ctx = y
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(ctx))
-        if freqs is not None:
-            q = rope_apply(q, freqs, self.num_heads)
         v = self.v(ctx)
         x = self.attn(q, k, v)
         if self.has_image_input:
@@ -211,17 +209,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(
-        self, x, context, t_mod, freqs,
-        ref_latents_hidden_states = None,
-        freqs_ref = None
-    ):
-
-        if hasattr(self, "ref_attn"):
-            ref_out = self.ref_attn(self.norm_ref(x), ref_latents_hidden_states, freqs_ref)
-            if hasattr(self, "gate_ref"):
-                x = self.gate(x, self.gate_ref, ref_out)
-
+    def forward(self, x, context, t_mod, freqs):
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
@@ -280,7 +268,6 @@ class WanModel(torch.nn.Module):
     ):
         super().__init__()
         self.dim = dim
-        self.in_dim = in_dim
         self.freq_dim = freq_dim
         self.has_image_input = has_image_input
         self.patch_size = patch_size
@@ -316,12 +303,6 @@ class WanModel(torch.nn.Module):
         x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
         return x, grid_size  # x, grid_size: (f, h, w)
 
-    def my_patchify(self, x: torch.Tensor, func : Callable[[torch.Tensor], torch.Tensor]):
-        x = func(x)
-        grid_size = x.shape[2:]
-        x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
-        return x, grid_size
-
     def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor):
         return rearrange(
             x, 'b (f h w) (x y z c) -> b c (f x) (h y) (w z)',
@@ -337,25 +318,17 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
-                ref_latents: torch.Tensor | None = None,
                 **kwargs,
                 ):
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
-
-
-        if not hasattr(self, "replace_textemb") or not self.replace_textemb:
-            context = self.text_embedding(context)
+        context = self.text_embedding(context)
 
         if self.has_image_input:
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
-
-        ref_latents_hidden_states = None
-        if hasattr(self, "ref_patch_embedding"):
-            ref_latents_hidden_states, _ = self.my_patchify(ref_latents, self.ref_patch_embedding)
 
         x, (f, h, w) = self.patchify(x)
 
@@ -364,19 +337,6 @@ class WanModel(torch.nn.Module):
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-
-        if hasattr(self, "ref_downscale_f"):
-            f_ref = f // self.ref_downscale_f
-            h_ref = h // self.ref_downscale_h
-            w_ref = w // self.ref_downscale_w
-
-            freqs_ref = torch.cat([
-                self.freqs[0][:f_ref].view(f_ref, 1, 1, -1).expand(f_ref, h_ref, w_ref, -1),
-                self.freqs[1][:h_ref].view(1, h_ref, 1, -1).expand(f_ref, h_ref, w_ref, -1),
-                self.freqs[2][:w_ref].view(1, 1, w_ref, -1).expand(f_ref, h_ref, w_ref, -1)
-            ], dim=-1).reshape(f_ref * h_ref * w_ref, 1, -1).to(x.device)
-        else:
-            freqs_ref = freqs
 
         def create_custom_forward(module):
             def custom_forward(*inputs):
@@ -395,11 +355,11 @@ class WanModel(torch.nn.Module):
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref,
+                        x, context, t_mod, freqs,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref)
+                x = block(x, context, t_mod, freqs)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
