@@ -258,7 +258,10 @@ class Head(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, t_mod):
-        shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
+        '''
+        t_mod: (B, dim)
+        '''
+        shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod[:, None, :]).chunk(2, dim=1)
         x = (self.head(self.norm(x) * (1 + scale) + shift))
         return x
 
@@ -342,6 +345,7 @@ class WanModel(torch.nn.Module):
                 ):
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep))
+        batch_size = x.shape[0]
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
 
 
