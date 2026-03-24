@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Tuple, Optional, Callable
-from einops import rearrange
+from typing import Tuple, Optional, Callable, List
+from einops import rearrange, repeat
 from .utils import hash_state_dict_keys
 try:
     import flash_attn_interface
@@ -213,20 +213,32 @@ class DiTBlock(nn.Module):
 
     def forward(
         self, x, context, t_mod, freqs,
-        ref_latents_hidden_states = None,
-        freqs_ref = None
+        ref_latents_hidden_states = None, freqs_ref = None,
+        num_view: int | None = None, grid_size : Tuple[int, int, int] | None = None, t_mod_view = None, freqs_view = None,
     ):
 
         if hasattr(self, "ref_attn"):
-            ref_out = self.ref_attn(self.norm_ref(x), ref_latents_hidden_states, freqs_ref)
-            if hasattr(self, "gate_ref"):
-                x = self.gate(x, self.gate_ref, ref_out)
+            ref_out = self.ref_attn(self.ref_norm(x), ref_latents_hidden_states, freqs_ref)
+            if hasattr(self, "ref_gate"):
+                x = self.gate(x, self.ref_gate, ref_out)
 
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
+            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1) # （1, 1, D)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+
+        if hasattr(self, "view_attn"):
+            '''
+            If has view, the input x shape: (BV, FHW, D)
+            '''
+            f, h, w = grid_size
+            x = rearrange(x, "(b v) (f h w) d -> (b f) (v h w) d", v=num_view, f=f, h=h, w=w)
+            shift_view_attn, scale_view_attn, gate_view_attn = (self.view_modulation.to(dtype=t_mod_view.dtype, device=t_mod_view.device) + t_mod_view).chunk(3, dim=1) # (1, 1, D)
+            input_x = modulate(self.view_norm(x), shift_view_attn, scale_view_attn)
+            x = self.gate(x, gate_view_attn, self.view_attn(input_x, freqs_view))
+            x = rearrange(x, "(b f) (v h w) d -> (b v) (f h w) d", f=f, h=h, w=w, v=num_view)
+
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -341,8 +353,12 @@ class WanModel(torch.nn.Module):
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
                 ref_latents: torch.Tensor | None = None,
+                num_views: int | None = None,
+                output_layers : List[int] | None = None,
                 **kwargs,
                 ):
+        if self.training:
+            output_layers = None
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep))
         batch_size = x.shape[0]
@@ -382,32 +398,58 @@ class WanModel(torch.nn.Module):
         else:
             freqs_ref = freqs
 
+        freqs_view = None
+        t_mod_view = None
+        if num_views is not None:
+
+            t_view = rearrange(t, "(b v) d -> b v d", v=num_views)
+            t_view = t_view[:, 0] # (B, D)
+            t_view = repeat(t_view, "b d -> (b f) d", f=f)
+            t_mod_view = self.time_projection(t_view).unflatten(1, (6, self.dim)) [:, :3] # (B*f, 3, D)
+
+
+            freqs_view = torch.cat([
+                self.freqs[0][:num_views].view(num_views, 1, 1, -1).expand(num_views, h, w, -1),
+                self.freqs[1][:h].view(1, h, 1, -1).expand(num_views, h, w, -1),
+                self.freqs[2][:w].view(1, 1, w, -1).expand(num_views, h, w, -1),
+            ], dim=-1).reshape(num_views * h * w, 1, -1).to(x.device)
+
         def create_custom_forward(module):
             def custom_forward(*inputs):
                 return module(*inputs)
             return custom_forward
 
-        for block in self.blocks:
+        if output_layers is not None:
+            ret_latents = []
+
+        for block_id, block in enumerate(self.blocks):
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs,
+                            x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view,freqs_view,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref,
+                        x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view,freqs_view,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref)
-
+                x = block(x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view, freqs_view)
+                if output_layers is not None and block_id in output_layers:
+                    tmp_x = x.clone()
+                    tmp_x = self.head(tmp_x, t)
+                    tmp_x = self.unpatchify(tmp_x, (f, h, w))
+                    ret_latents.append(tmp_x)
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
-        return x
+        if output_layers is not None:
+            return x, ret_latents
+        else:
+            return x
 
     @staticmethod
     def state_dict_converter():
