@@ -145,7 +145,8 @@ class SelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6, has_image_input: bool = False):
+    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6, has_image_input: bool = False,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -165,7 +166,10 @@ class CrossAttention(nn.Module):
 
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, freqs = None):
+    def forward(
+        self, x: torch.Tensor, y: torch.Tensor, freqs = None,
+        plucker_fea = None
+    ):
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
@@ -182,6 +186,20 @@ class CrossAttention(nn.Module):
             v_img = self.v_img(img)
             y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
             x = x + y
+
+
+        if plucker_fea is not None:
+            # plucker_fea: (B, V, N_tokens, plucker_fea_dim)
+            # x: (B*V, f*h*w, dim)
+            plucker_fea = repeat(plucker_fea, "b v n d -> b v (f n) d", f=x.shape[1] // plucker_fea.shape[2])
+            plucker_fea = rearrange(plucker_fea, "b v l d -> (b v) l d")
+            plucker_fea = self.plucker_linear_encoder(plucker_fea)
+            combined = self.latent_linear_encoder(x)
+            combined = combined + plucker_fea
+            shift = self.camera_modulate(combined)
+            is_all_zeros = torch.all(plucker_fea == 0).item()
+            if not is_all_zeros:
+                x = x + shift
         return self.o(x)
 
 
@@ -193,6 +211,7 @@ class GateModule(nn.Module):
         return x + gate * residual
 
 class DiTBlock(nn.Module):
+    cross_attn: CrossAttention
     def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
@@ -215,18 +234,21 @@ class DiTBlock(nn.Module):
         self, x, context, t_mod, freqs,
         ref_latents_hidden_states = None, freqs_ref = None,
         num_view: int | None = None, grid_size : Tuple[int, int, int] | None = None, t_mod_view = None, freqs_view = None,
+        plucker_fea: torch.Tensor | None = None
     ):
-
-        if hasattr(self, "ref_attn"):
-            ref_out = self.ref_attn(self.ref_norm(x), ref_latents_hidden_states, freqs_ref)
-            if hasattr(self, "ref_gate"):
-                x = self.gate(x, self.ref_gate, ref_out)
 
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1) # （1, 1, D)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+
+        x = x + self.cross_attn(self.norm3(x), context, plucker_fea=plucker_fea)
+
+        if hasattr(self, "ref_attn"):
+            ref_out = self.ref_attn(self.ref_norm(x), ref_latents_hidden_states, freqs_ref)
+            if hasattr(self, "ref_gate"):
+                x = self.gate(x, self.ref_gate, ref_out)
 
         if hasattr(self, "view_attn"):
             '''
@@ -239,7 +261,7 @@ class DiTBlock(nn.Module):
             x = self.gate(x, gate_view_attn, self.view_attn(input_x, freqs_view))
             x = rearrange(x, "(b f) (v h w) d -> (b v) (f h w) d", f=f, h=h, w=w, v=num_view)
 
-        x = x + self.cross_attn(self.norm3(x), context)
+
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -353,6 +375,7 @@ class WanModel(torch.nn.Module):
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
                 ref_latents: torch.Tensor | None = None,
+                plucker_fea: torch.Tensor | None = None,
                 num_views: int | None = None,
                 output_layers : List[int] | None = None,
                 **kwargs,
@@ -429,16 +452,18 @@ class WanModel(torch.nn.Module):
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
                             x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view,freqs_view,
+                            plucker_fea,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
                         x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view,freqs_view,
+                        plucker_fea,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view, freqs_view)
+                x = block(x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view, freqs_view, plucker_fea)
                 if output_layers is not None and block_id in output_layers:
                     tmp_x = x.clone()
                     tmp_x = self.head(tmp_x, t)

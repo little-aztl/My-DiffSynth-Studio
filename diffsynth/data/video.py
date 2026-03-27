@@ -7,7 +7,7 @@ from tqdm import tqdm
 class LowMemoryVideo:
     def __init__(self, file_name):
         self.reader = imageio.get_reader(file_name)
-    
+
     def __len__(self):
         return self.reader.count_frames()
 
@@ -51,7 +51,7 @@ class LowMemoryImageFolder:
             self.file_list = search_for_images(folder)
         else:
             self.file_list = [os.path.join(folder, file_name) for file_name in file_list]
-    
+
     def __len__(self):
         return len(self.file_list)
 
@@ -145,4 +145,4 @@ def save_video(frames, save_path, fps, quality=9, ffmpeg_params=None):
 def save_frames(frames, save_path):
     os.makedirs(save_path, exist_ok=True)
     for i, frame in enumerate(tqdm(frames, desc="Saving images")):
-        frame.save(os.path.join(save_path, f"{i}.png"))
+        frame.save(os.path.join(save_path, f"{i}.png")) 
