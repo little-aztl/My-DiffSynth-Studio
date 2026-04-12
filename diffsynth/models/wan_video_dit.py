@@ -24,12 +24,12 @@ except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
 
 
-def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
-    if compatibility_mode:
+def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attn_mask: Optional[torch.Tensor] = None):
+    if attn_mask is not None or compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     elif FLASH_ATTN_3_AVAILABLE:
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
@@ -113,8 +113,8 @@ class AttentionModule(nn.Module):
         super().__init__()
         self.num_heads = num_heads
 
-    def forward(self, q, k, v):
-        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads)
+    def forward(self, q, k, v, attn_mask: Optional[torch.Tensor] = None):
+        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, attn_mask=attn_mask)
         return x
 
 
@@ -134,13 +134,18 @@ class SelfAttention(nn.Module):
 
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs):
+    def forward(self, x, freqs: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
-        q = rope_apply(q, freqs, self.num_heads)
-        k = rope_apply(k, freqs, self.num_heads)
-        x = self.attn(q, k, v)
+        if freqs is not None:
+            q = rope_apply(q, freqs, self.num_heads)
+            k = rope_apply(k, freqs, self.num_heads)
+        if attn_mask is not None:
+            # attn_mask: (B, L), bool, True=valid, False=invalid
+            # SDPA bool mask: True=attend, False=mask out (same convention)
+            attn_mask = attn_mask[:, None, None, :] # (B, 1, 1, L)
+        x = self.attn(q, k, v, attn_mask=attn_mask)
         return self.o(x)
 
 
@@ -168,7 +173,7 @@ class CrossAttention(nn.Module):
 
     def forward(
         self, x: torch.Tensor, y: torch.Tensor, freqs = None,
-        plucker_fea = None
+        plucker_fea = None, view_mask: Optional[torch.Tensor] = None
     ):
         if self.has_image_input:
             img = y[:, :257]
@@ -187,7 +192,6 @@ class CrossAttention(nn.Module):
             y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
             x = x + y
 
-
         if plucker_fea is not None:
             # plucker_fea: (B, V, N_tokens, plucker_fea_dim)
             # x: (B*V, f*h*w, dim)
@@ -197,10 +201,52 @@ class CrossAttention(nn.Module):
             combined = self.latent_linear_encoder(x)
             combined = combined + plucker_fea
             shift = self.camera_modulate(combined)
-            is_all_zeros = torch.all(plucker_fea == 0).item()
-            if not is_all_zeros:
-                x = x + shift
+            if view_mask is not None:
+                # view_mask: (B, V), True=valid. Zero out shift for padding views.
+                # x shape: (B*V, L, dim)
+                valid = view_mask.reshape(-1, 1, 1).to(dtype=shift.dtype)  # (B*V, 1, 1)
+                shift = shift * valid
+            x = x + shift
         return self.o(x)
+
+class BiCrossAttention(nn.Module):
+    def __init__(self, dim:int, num_heads:int, eps: float = 1e-6):
+        super().__init__()
+        self.num_heads = num_heads
+        self.q_video = nn.Linear(dim, dim)
+        self.k_video = nn.Linear(dim, dim)
+        self.v_video = nn.Linear(dim, dim)
+        self.o_video = nn.Linear(dim, dim)
+        self.norm_q_video = RMSNorm(dim, eps=eps)
+        self.norm_k_video = RMSNorm(dim, eps=eps)
+
+        self.q_mano = nn.Linear(dim, dim)
+        self.k_mano = nn.Linear(dim, dim)
+        self.v_mano = nn.Linear(dim, dim)
+        self.o_mano = nn.Linear(dim, dim)
+        self.norm_q_mano = RMSNorm(dim, eps=eps)
+        self.norm_k_mano = RMSNorm(dim, eps=eps)
+
+        self.attn = AttentionModule(num_heads)
+
+    def forward(self, x_video: torch.Tensor, x_mano: torch.Tensor, freqs_video : torch.Tensor, freqs_mano: torch.Tensor):
+        q_video = self.norm_q_video(self.q_video(x_video))
+        k_video = self.norm_k_video(self.k_video(x_video))
+        q_video = rope_apply(q_video, freqs_video, self.num_heads)
+        k_video = rope_apply(k_video, freqs_video, self.num_heads)
+        v_video = self.v_video(x_video)
+
+        q_mano = self.norm_q_mano(self.q_mano(x_mano))
+        k_mano = self.norm_k_mano(self.k_mano(x_mano))
+        q_mano = rope_apply(q_mano, freqs_mano, self.num_heads)
+        k_mano = rope_apply(k_mano, freqs_mano, self.num_heads)
+        v_mano = self.v_mano(x_mano)
+
+        x_video = self.attn(q_video, k_mano, v_mano)
+        x_mano = self.attn(q_mano, k_video, v_video)
+        return self.o_video(x_video), self.o_mano(x_mano)
+
+
 
 
 class GateModule(nn.Module):
@@ -212,6 +258,13 @@ class GateModule(nn.Module):
 
 class DiTBlock(nn.Module):
     cross_attn: CrossAttention
+    mano_inter_view_attention: SelfAttention
+    mano_across_view_attention: SelfAttention
+    bi_cross_attn : BiCrossAttention
+    mano_modulation : nn.Parameter
+    gate4mano_after_bicross: nn.Parameter
+    gate4video_after_bicross: nn.Parameter
+
     def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
@@ -222,8 +275,7 @@ class DiTBlock(nn.Module):
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(
             dim, num_heads, eps, has_image_input=has_image_input)
-        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.layer_norm_bare = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(dim, eps=eps)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(
             approximate='tanh'), nn.Linear(ffn_dim, dim))
@@ -233,17 +285,21 @@ class DiTBlock(nn.Module):
     def forward(
         self, x, context, t_mod, freqs,
         ref_latents_hidden_states = None, freqs_ref = None,
-        num_view: int | None = None, grid_size : Tuple[int, int, int] | None = None, t_mod_view = None, freqs_view = None,
-        plucker_fea: torch.Tensor | None = None
+        num_view: int | None = None, grid_size : Tuple[int, int, int] | None = None, t_mod_view = None, view_mask : torch.Tensor | None = None,
+        plucker_fea: torch.Tensor | None = None, x_mano: torch.Tensor | None = None, freqs_mano: torch.Tensor | None = None, t_mod_mano1: torch.Tensor | None = None, t_mod_mano2: torch.Tensor | None = None
     ):
+        '''
+        x_mano: (B*V, f, D)
+        '''
 
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1) # （1, 1, D)
-        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1) # （BV, 1, D)
+
+        input_x = modulate(self.layer_norm_bare(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
 
-        x = x + self.cross_attn(self.norm3(x), context, plucker_fea=plucker_fea)
+        x = x + self.cross_attn(self.norm3(x), context, plucker_fea=plucker_fea, view_mask=view_mask)
 
         if hasattr(self, "ref_attn"):
             ref_out = self.ref_attn(self.ref_norm(x), ref_latents_hidden_states, freqs_ref)
@@ -253,17 +309,44 @@ class DiTBlock(nn.Module):
         if hasattr(self, "view_attn"):
             '''
             If has view, the input x shape: (BV, FHW, D)
+            view mask: (B, V), bool, True=valid, False=invalid
             '''
             f, h, w = grid_size
             x = rearrange(x, "(b v) (f h w) d -> (b f) (v h w) d", v=num_view, f=f, h=h, w=w)
+            if view_mask is not None:
+                expanded_view_mask = repeat(view_mask, "b v -> b f v h w", f=f, h=h, w=w)
+                expanded_view_mask = rearrange(expanded_view_mask, "b f v h w -> (b f) (v h w)")
+
             shift_view_attn, scale_view_attn, gate_view_attn = (self.view_modulation.to(dtype=t_mod_view.dtype, device=t_mod_view.device) + t_mod_view).chunk(3, dim=1) # (1, 1, D)
             input_x = modulate(self.view_norm(x), shift_view_attn, scale_view_attn)
-            x = self.gate(x, gate_view_attn, self.view_attn(input_x, freqs_view))
+            x = self.gate(x, gate_view_attn, self.view_attn(input_x, attn_mask=expanded_view_mask))
             x = rearrange(x, "(b f) (v h w) d -> (b v) (f h w) d", f=f, h=h, w=w, v=num_view)
 
+        if x_mano is not None:
+            shift_mano_attn1, scale_mano_attn1, gate_mano_attn1, shift_mano_mlp, scale_mano_mlp, gate_mano_mlp = (self.mano_modulation[:, :6].to(dtype=t_mod_mano1.dtype, device=t_mod_mano1.device) + t_mod_mano1).chunk(6, dim=1) # (BV, 1, D)
+            shift_mano_attn2, scale_mano_attn2, gate_mano_attn2 = (self.mano_modulation[:, 6:].to(dtype=t_mod_mano2.dtype, device=t_mod_mano2.device) + t_mod_mano2).chunk(3, dim=1) # (Bf, 1, D)
 
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+            input_mano = modulate(self.layer_norm_bare(x_mano), shift_mano_attn1, scale_mano_attn1)
+            x_mano = self.gate(x_mano, gate_mano_attn1, self.mano_inter_view_attention(input_mano, freqs=freqs_mano))
+
+            x_mano = rearrange(x_mano, "(B V) f D -> (B f) V D", V=num_view)
+            input_mano = modulate(self.layer_norm_bare(x_mano), shift_mano_attn2, scale_mano_attn2)
+            x_mano = self.gate(x_mano, gate_mano_attn2, self.mano_across_view_attention(input_mano, attn_mask=repeat(view_mask, "B v -> (B f) v", f=f)))
+
+            x_mano = rearrange(x_mano, "(B f) V D -> (B V) f D", f=f)
+            output_video, output_mano = self.bi_cross_attn(self.layer_norm_bare(x), self.layer_norm_bare(x_mano), freqs, freqs_mano)
+
+            x = self.gate(x, self.gate4video_after_bicross, output_video)
+            x_mano = self.gate(x_mano, self.gate4mano_after_bicross, output_mano)
+
+            input_mano = modulate(self.layer_norm_bare(x_mano), shift_mano_mlp, scale_mano_mlp)
+            x_mano = self.gate(x_mano, gate_mano_mlp, self.ffn_mano(input_mano))
+
+
+        input_x = modulate(self.layer_norm_bare(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
+        if x_mano is not None:
+            x = (x, x_mano)
         return x
 
 
@@ -301,6 +384,7 @@ class Head(nn.Module):
 
 
 class WanModel(torch.nn.Module):
+    copy_video_latent_and_subsample: nn.Conv2d
     def __init__(
         self,
         dim: int,
@@ -318,9 +402,11 @@ class WanModel(torch.nn.Module):
         super().__init__()
         self.dim = dim
         self.in_dim = in_dim
+        self.num_heads = num_heads
         self.freq_dim = freq_dim
         self.has_image_input = has_image_input
         self.patch_size = patch_size
+        self.num_layers = num_layers
 
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
@@ -377,6 +463,7 @@ class WanModel(torch.nn.Module):
                 ref_latents: torch.Tensor | None = None,
                 plucker_fea: torch.Tensor | None = None,
                 num_views: int | None = None,
+                view_mask: torch.Tensor | None = None,
                 output_layers : List[int] | None = None,
                 **kwargs,
                 ):
@@ -385,7 +472,7 @@ class WanModel(torch.nn.Module):
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep))
         batch_size = x.shape[0]
-        t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+        t_mod = self.time_projection(t).unflatten(1, (6, self.dim)) # (BV, 6, D)
 
 
         if not hasattr(self, "replace_textemb") or not self.replace_textemb:
@@ -421,21 +508,22 @@ class WanModel(torch.nn.Module):
         else:
             freqs_ref = freqs
 
-        freqs_view = None
         t_mod_view = None
         if num_views is not None:
 
             t_view = rearrange(t, "(b v) d -> b v d", v=num_views)
             t_view = t_view[:, 0] # (B, D)
-            t_view = repeat(t_view, "b d -> (b f) d", f=f)
-            t_mod_view = self.time_projection(t_view).unflatten(1, (6, self.dim)) [:, :3] # (B*f, 3, D)
+            t_view = repeat(t_view, "b d -> (b f) d", f=f) # (B*f, D)
+            t_mod_view = self.time_projection_view(t_view).unflatten(1, (3, self.dim)) # (B*f, 3, D)
 
+        t_mod_mano = None
+        if hasattr(self, "time_projection_mano"):
+            t_mod_mano = self.time_projection_mano(t).unflatten(1, (9, self.dim)) # (BV, 9, D)
+            t_mod_mano1 = t_mod_mano[:, :6] # (BV, 6, D)
+            t_mod_mano2 = rearrange(t_mod_mano[:, 6:], "(B V) n d -> B V n d", V=num_views) # (B, V, 3, D)
+            t_mod_mano2 = t_mod_mano2[:, 0] # (B, 3, D)
+            t_mod_mano2 = repeat(t_mod_mano2, "b n d -> (b f) n d", f=f) # (B*f, 3, D)
 
-            freqs_view = torch.cat([
-                self.freqs[0][:num_views].view(num_views, 1, 1, -1).expand(num_views, h, w, -1),
-                self.freqs[1][:h].view(1, h, 1, -1).expand(num_views, h, w, -1),
-                self.freqs[2][:w].view(1, 1, w, -1).expand(num_views, h, w, -1),
-            ], dim=-1).reshape(num_views * h * w, 1, -1).to(x.device)
 
         def create_custom_forward(module):
             def custom_forward(*inputs):
@@ -445,34 +533,48 @@ class WanModel(torch.nn.Module):
         if output_layers is not None:
             ret_latents = []
 
+        x_mano = None
+        mano_f_freqs = self.mano_f_freqs[:f].view(f, 1, -1).to(x.device) if hasattr(self, "mano_f_freqs") else None
+        mano_start_block_idx = self.mano_start_block_idx if hasattr(self, "mano_start_block_idx") else self.num_layers
         for block_id, block in enumerate(self.blocks):
+            if block_id == mano_start_block_idx:
+                x_mano = x.clone() # (BV, f*h*w, D)
+                x_mano = rearrange(x_mano, "(B V) (f h w) D -> (B V f) D h w", V=num_views, f=f, h=h, w=w)
+                x_mano = self.copy_video_latent_and_subsample(x_mano).squeeze(-1).squeeze(-1) # (B V f) D
+                x_mano = rearrange(x_mano, "(B V f) D -> (B V) f D", V=num_views, f=f)
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view,freqs_view,
-                            plucker_fea,
+                            x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view, view_mask,
+                            plucker_fea, x_mano, mano_f_freqs, t_mod_mano1, t_mod_mano2,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view,freqs_view,
-                        plucker_fea,
+                        x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view, view_mask,
+                        plucker_fea, x_mano, mano_f_freqs, t_mod_mano1, t_mod_mano2,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view, freqs_view, plucker_fea)
-                if output_layers is not None and block_id in output_layers:
-                    tmp_x = x.clone()
-                    tmp_x = self.head(tmp_x, t)
-                    tmp_x = self.unpatchify(tmp_x, (f, h, w))
-                    ret_latents.append(tmp_x)
+                x = block(x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view, view_mask, plucker_fea, x_mano, mano_f_freqs, t_mod_mano1, t_mod_mano2)
+
+            if block_id >= mano_start_block_idx:
+                x, x_mano = x
+            if output_layers is not None and block_id in output_layers:
+                tmp_x = x.clone()
+                tmp_x = self.head(tmp_x, t)
+                tmp_x = self.unpatchify(tmp_x, (f, h, w))
+                ret_latents.append(tmp_x)
+
+
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
-        if output_layers is not None:
-            return x, ret_latents
+        if x_mano is not None:
+            x_mano = rearrange(x_mano, "(B V) f D -> B V f D", V=num_views)
+            return x, x_mano
         else:
             return x
 
