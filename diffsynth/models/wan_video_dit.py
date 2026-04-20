@@ -334,10 +334,12 @@ class DiTBlock(nn.Module):
             x_mano = self.gate(x_mano, gate_mano_attn2, self.mano_across_view_attention(input_mano, attn_mask=repeat(view_mask, "B v -> (B f) v", f=f)))
 
             x_mano = rearrange(x_mano, "(B f) V D -> (B V) f D", f=f)
-            output_video, output_mano = self.bi_cross_attn(self.layer_norm_bare(x), self.layer_norm_bare(x_mano), freqs, freqs_mano)
 
-            x = self.gate(x, self.gate4video_after_bicross, output_video)
-            x_mano = self.gate(x_mano, self.gate4mano_after_bicross, output_mano)
+            if hasattr(self, "bi_cross_attn"):
+                output_video, output_mano = self.bi_cross_attn(self.layer_norm_bare(x), self.layer_norm_bare(x_mano), freqs, freqs_mano)
+
+                x = self.gate(x, self.gate4video_after_bicross, output_video)
+                x_mano = self.gate(x_mano, self.gate4mano_after_bicross, output_mano)
 
             input_mano = modulate(self.layer_norm_bare(x_mano), shift_mano_mlp, scale_mano_mlp)
             x_mano = self.gate(x_mano, gate_mano_mlp, self.ffn_mano(input_mano))
@@ -516,7 +518,8 @@ class WanModel(torch.nn.Module):
             t_view = repeat(t_view, "b d -> (b f) d", f=f) # (B*f, D)
             t_mod_view = self.time_projection_view(t_view).unflatten(1, (3, self.dim)) # (B*f, 3, D)
 
-        t_mod_mano = None
+        t_mod_mano1 = None
+        t_mod_mano2 = None
         if hasattr(self, "time_projection_mano"):
             t_mod_mano = self.time_projection_mano(t).unflatten(1, (9, self.dim)) # (BV, 9, D)
             t_mod_mano1 = t_mod_mano[:, :6] # (BV, 6, D)
