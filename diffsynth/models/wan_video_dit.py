@@ -289,7 +289,7 @@ class DiTBlock(nn.Module):
         plucker_fea: torch.Tensor | None = None, x_mano: torch.Tensor | None = None, freqs_mano: torch.Tensor | None = None, t_mod_mano1: torch.Tensor | None = None, t_mod_mano2: torch.Tensor | None = None
     ):
         '''
-        x_mano: (B*V, f, D)
+        x_mano: (B*V, f*k, D), where k is the number of MANO tokens per temporal block.
         '''
 
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -313,6 +313,7 @@ class DiTBlock(nn.Module):
             '''
             f, h, w = grid_size
             x = rearrange(x, "(b v) (f h w) d -> (b f) (v h w) d", v=num_view, f=f, h=h, w=w)
+            expanded_view_mask = None
             if view_mask is not None:
                 expanded_view_mask = repeat(view_mask, "b v -> b f v h w", f=f, h=h, w=w)
                 expanded_view_mask = rearrange(expanded_view_mask, "b f v h w -> (b f) (v h w)")
@@ -323,17 +324,19 @@ class DiTBlock(nn.Module):
             x = rearrange(x, "(b f) (v h w) d -> (b v) (f h w) d", f=f, h=h, w=w, v=num_view)
 
         if x_mano is not None:
+            mano_tokens_per_frame = x_mano.shape[1] // f
             shift_mano_attn1, scale_mano_attn1, gate_mano_attn1, shift_mano_mlp, scale_mano_mlp, gate_mano_mlp = (self.mano_modulation[:, :6].to(dtype=t_mod_mano1.dtype, device=t_mod_mano1.device) + t_mod_mano1).chunk(6, dim=1) # (BV, 1, D)
-            shift_mano_attn2, scale_mano_attn2, gate_mano_attn2 = (self.mano_modulation[:, 6:].to(dtype=t_mod_mano2.dtype, device=t_mod_mano2.device) + t_mod_mano2).chunk(3, dim=1) # (Bf, 1, D)
+            shift_mano_attn2, scale_mano_attn2, gate_mano_attn2 = (self.mano_modulation[:, 6:].to(dtype=t_mod_mano2.dtype, device=t_mod_mano2.device) + t_mod_mano2).chunk(3, dim=1) # (B*f, 1, D)
 
             input_mano = modulate(self.layer_norm_bare(x_mano), shift_mano_attn1, scale_mano_attn1)
             x_mano = self.gate(x_mano, gate_mano_attn1, self.mano_inter_view_attention(input_mano, freqs=freqs_mano))
 
-            x_mano = rearrange(x_mano, "(B V) f D -> (B f) V D", V=num_view)
+            x_mano = rearrange(x_mano, "(B V) (f k) D -> (B f) (V k) D", V=num_view, f=f, k=mano_tokens_per_frame)
             input_mano = modulate(self.layer_norm_bare(x_mano), shift_mano_attn2, scale_mano_attn2)
-            x_mano = self.gate(x_mano, gate_mano_attn2, self.mano_across_view_attention(input_mano, attn_mask=repeat(view_mask, "B v -> (B f) v", f=f)))
+            mano_view_mask = None if view_mask is None else repeat(view_mask, "B v -> (B f) (v k)", f=f, k=mano_tokens_per_frame)
+            x_mano = self.gate(x_mano, gate_mano_attn2, self.mano_across_view_attention(input_mano, attn_mask=mano_view_mask))
 
-            x_mano = rearrange(x_mano, "(B f) V D -> (B V) f D", f=f)
+            x_mano = rearrange(x_mano, "(B f) (V k) D -> (B V) (f k) D", V=num_view, f=f, k=mano_tokens_per_frame)
 
             if hasattr(self, "bi_cross_attn"):
                 output_video, output_mano = self.bi_cross_attn(self.layer_norm_bare(x), self.layer_norm_bare(x_mano), freqs, freqs_mano)
@@ -464,6 +467,7 @@ class WanModel(torch.nn.Module):
                 use_gradient_checkpointing_offload: bool = False,
                 ref_latents: torch.Tensor | None = None,
                 plucker_fea: torch.Tensor | None = None,
+                camera_pose_encoding: torch.Tensor | None = None,
                 num_views: int | None = None,
                 view_mask: torch.Tensor | None = None,
                 output_layers : List[int] | None = None,
@@ -518,6 +522,8 @@ class WanModel(torch.nn.Module):
             t_view = repeat(t_view, "b d -> (b f) d", f=f) # (B*f, D)
             t_mod_view = self.time_projection_view(t_view).unflatten(1, (3, self.dim)) # (B*f, 3, D)
 
+        mano_tokens_per_frame = getattr(self, "mano_tokens_per_frame", 1)
+        mano_branch_tokens_per_frame = getattr(self, "mano_branch_tokens_per_frame", mano_tokens_per_frame)
         t_mod_mano1 = None
         t_mod_mano2 = None
         if hasattr(self, "time_projection_mano"):
@@ -537,14 +543,25 @@ class WanModel(torch.nn.Module):
             ret_latents = []
 
         x_mano = None
-        mano_f_freqs = self.mano_f_freqs[:f].view(f, 1, -1).to(x.device) if hasattr(self, "mano_f_freqs") else None
+        mano_f_freqs = None
+        if hasattr(self, "mano_f_freqs"):
+            mano_f_freqs = self.mano_f_freqs[:f].repeat_interleave(mano_branch_tokens_per_frame, dim=0).view(f * mano_branch_tokens_per_frame, 1, -1).to(x.device)
         mano_start_block_idx = self.mano_start_block_idx if hasattr(self, "mano_start_block_idx") else self.num_layers
         for block_id, block in enumerate(self.blocks):
             if block_id == mano_start_block_idx:
+                if camera_pose_encoding is None:
+                    raise ValueError("camera_pose_encoding is required when MANO attention is enabled.")
                 x_mano = x.clone() # (BV, f*h*w, D)
                 x_mano = rearrange(x_mano, "(B V) (f h w) D -> (B V f) D h w", V=num_views, f=f, h=h, w=w)
-                x_mano = self.copy_video_latent_and_subsample(x_mano).squeeze(-1).squeeze(-1) # (B V f) D
-                x_mano = rearrange(x_mano, "(B V f) D -> (B V) f D", V=num_views, f=f)
+                x_mano = self.copy_video_latent_and_subsample(x_mano) # (B V f) (k*D) 1 1
+                x_mano = rearrange(x_mano, "(B V f) (k D) 1 1 -> B V f k D", V=num_views, f=f, k=mano_tokens_per_frame, D=self.dim)
+
+                camera_pose_encoding = camera_pose_encoding.to(device=x.device, dtype=x.dtype)
+                camera_token = self.mano_camera_token_encoder(camera_pose_encoding) # (B, V, D)
+                camera_token = repeat(camera_token, "B V D -> B V f 1 D", f=f)
+
+                x_mano = torch.cat([x_mano, camera_token], dim=3)
+                x_mano = rearrange(x_mano, "B V f n D -> (B V) (f n) D")
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
@@ -576,7 +593,7 @@ class WanModel(torch.nn.Module):
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
         if x_mano is not None:
-            x_mano = rearrange(x_mano, "(B V) f D -> B V f D", V=num_views)
+            x_mano = rearrange(x_mano, "(B V) (f n) D -> B V f n D", V=num_views, f=f, n=mano_branch_tokens_per_frame)
             return x, x_mano
         else:
             return x
