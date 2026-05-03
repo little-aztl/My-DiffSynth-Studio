@@ -407,6 +407,8 @@ class WanModel(torch.nn.Module):
         super().__init__()
         self.dim = dim
         self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.eps = eps
         self.num_heads = num_heads
         self.freq_dim = freq_dim
         self.has_image_input = has_image_input
@@ -590,13 +592,18 @@ class WanModel(torch.nn.Module):
                 ret_latents.append(tmp_x)
 
 
-        x = self.head(x, t)
-        x = self.unpatchify(x, (f, h, w))
+        color_x = self.head(x, t)
+        color_x = self.unpatchify(color_x, (f, h, w))
+        ret = [color_x]
+        if hasattr(self, "mask_head"):
+            mask_x = self.mask_head(x, t)
+            mask_x = self.unpatchify(mask_x, (f, h, w))
+            ret.append(mask_x)
         if x_mano is not None:
             x_mano = rearrange(x_mano, "(B V) (f n) D -> B V f n D", V=num_views, f=f, n=mano_branch_tokens_per_frame)
-            return x, x_mano
-        else:
-            return x
+            ret.append(x_mano)
+        return tuple(ret) if len(ret) > 1 else ret[0]
+
 
     @staticmethod
     def state_dict_converter():
