@@ -284,7 +284,7 @@ class DiTBlock(nn.Module):
 
     def forward(
         self, x, context, t_mod, freqs,
-        ref_latents_hidden_states = None, freqs_ref = None,
+        ref_latents_hidden_states = None,
         num_view: int | None = None, grid_size : Tuple[int, int, int] | None = None, t_mod_view = None, view_mask : torch.Tensor | None = None,
         plucker_fea: torch.Tensor | None = None, x_mano: torch.Tensor | None = None, freqs_mano: torch.Tensor | None = None, t_mod_mano1: torch.Tensor | None = None, t_mod_mano2: torch.Tensor | None = None
     ):
@@ -302,7 +302,7 @@ class DiTBlock(nn.Module):
         x = x + self.cross_attn(self.norm3(x), context, plucker_fea=plucker_fea, view_mask=view_mask)
 
         if hasattr(self, "ref_attn"):
-            ref_out = self.ref_attn(self.ref_norm(x), ref_latents_hidden_states, freqs_ref)
+            ref_out = self.ref_attn(self.ref_norm(x), ref_latents_hidden_states, freqs)
             if hasattr(self, "ref_gate"):
                 x = self.gate(x, self.ref_gate, ref_out)
 
@@ -465,7 +465,6 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
-                ref_latents: torch.Tensor | None = None,
                 plucker_fea: torch.Tensor | None = None,
                 camera_pose_encoding: torch.Tensor | None = None,
                 num_views: int | None = None,
@@ -501,18 +500,6 @@ class WanModel(torch.nn.Module):
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
-        if hasattr(self, "ref_downscale_f"):
-            f_ref = f // self.ref_downscale_f
-            h_ref = h // self.ref_downscale_h
-            w_ref = w // self.ref_downscale_w
-
-            freqs_ref = torch.cat([
-                self.freqs[0][:f_ref].view(f_ref, 1, 1, -1).expand(f_ref, h_ref, w_ref, -1),
-                self.freqs[1][:h_ref].view(1, h_ref, 1, -1).expand(f_ref, h_ref, w_ref, -1),
-                self.freqs[2][:w_ref].view(1, 1, w_ref, -1).expand(f_ref, h_ref, w_ref, -1)
-            ], dim=-1).reshape(f_ref * h_ref * w_ref, 1, -1).to(x.device)
-        else:
-            freqs_ref = freqs
 
         t_mod_view = None
         if num_views is not None:
@@ -567,19 +554,19 @@ class WanModel(torch.nn.Module):
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view, view_mask,
+                            x, context, t_mod, freqs, ref_latents_hidden_states, num_views, (f, h, w), t_mod_view, view_mask,
                             plucker_fea, x_mano, mano_f_freqs, t_mod_mano1, t_mod_mano2,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view, view_mask,
+                        x, context, t_mod, freqs, ref_latents_hidden_states,  num_views, (f, h, w), t_mod_view, view_mask,
                         plucker_fea, x_mano, mano_f_freqs, t_mod_mano1, t_mod_mano2,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs, ref_latents_hidden_states, freqs_ref, num_views, (f, h, w), t_mod_view, view_mask, plucker_fea, x_mano, mano_f_freqs, t_mod_mano1, t_mod_mano2)
+                x = block(x, context, t_mod, freqs, ref_latents_hidden_states,  num_views, (f, h, w), t_mod_view, view_mask, plucker_fea, x_mano, mano_f_freqs, t_mod_mano1, t_mod_mano2)
 
             if block_id >= mano_start_block_idx:
                 x, x_mano = x
