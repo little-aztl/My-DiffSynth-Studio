@@ -205,6 +205,7 @@ class AcceleratedVideoBranchDiTBlock(DiTBlock):
         self,
         x: torch.Tensor,
         context: torch.Tensor,
+        context_attention_bias: torch.Tensor | None,
         plucker_fea: torch.Tensor,
         *,
         num_views: int,
@@ -215,7 +216,46 @@ class AcceleratedVideoBranchDiTBlock(DiTBlock):
         q = cross_attn.norm_q(cross_attn.q(x))
         k = cross_attn.norm_k(cross_attn.k(context))
         v = cross_attn.v(context)
-        attention_output = cross_attn.attn(q, k, v)
+        # Every view in one clip uses the same text condition.  Keeping the
+        # context at clip batch size lets the expensive 4096/5120-wide K/V
+        # projections run once per clip; repeat only their much smaller
+        # per-head outputs for SDPA.  A B*V context remains supported for
+        # callers that intentionally provide different text per view.
+        if k.shape[0] != q.shape[0]:
+            expected_query_batch = k.shape[0] * num_views
+            if q.shape[0] != expected_query_batch:
+                raise ValueError(
+                    "Cross-attention context batch must be B or B*V; got "
+                    f"Q batch {q.shape[0]}, K/V batch {k.shape[0]}, V={num_views}"
+                )
+            k = repeat(k, "b s d -> (b v) s d", v=num_views)
+            v = repeat(v, "b s d -> (b v) s d", v=num_views)
+        attention_mask = None
+        if context_attention_bias is not None:
+            if (
+                context_attention_bias.ndim != 2
+                or context_attention_bias.shape[1] != k.shape[1]
+            ):
+                raise ValueError(
+                    "context_attention_bias must have shape (B, S) or "
+                    f"(B*V, S); got {tuple(context_attention_bias.shape)} "
+                    f"for context length {k.shape[1]}"
+                )
+            if context_attention_bias.shape[0] != q.shape[0]:
+                expected_query_batch = context_attention_bias.shape[0] * num_views
+                if q.shape[0] != expected_query_batch:
+                    raise ValueError(
+                        "context_attention_bias batch must be B or B*V; got "
+                        f"Q batch {q.shape[0]}, bias batch "
+                        f"{context_attention_bias.shape[0]}, V={num_views}"
+                    )
+                context_attention_bias = repeat(
+                    context_attention_bias, "b s -> (b v) s", v=num_views
+                )
+            attention_mask = context_attention_bias[:, None, None, :].to(
+                dtype=q.dtype, device=q.device
+            )
+        attention_output = cross_attn.attn(q, k, v, attn_mask=attention_mask)
         attention_output = self._apply_camera_shift(
             attention_output,
             plucker_fea,
@@ -229,6 +269,7 @@ class AcceleratedVideoBranchDiTBlock(DiTBlock):
         self,
         x: torch.Tensor,
         context: torch.Tensor,
+        context_attention_bias: torch.Tensor | None,
         t_mod: torch.Tensor,
         rotations: torch.Tensor,
         num_views: int,
@@ -246,6 +287,7 @@ class AcceleratedVideoBranchDiTBlock(DiTBlock):
         x = x + self._video_cross_attention(
             self.norm3(x),
             context,
+            context_attention_bias,
             plucker_fea,
             num_views=num_views,
             grid_size=grid_size,
@@ -306,6 +348,7 @@ def _call_video_branch_block(
     block: AcceleratedVideoBranchDiTBlock,
     x: torch.Tensor,
     context: torch.Tensor,
+    context_attention_bias: torch.Tensor | None,
     t_mod: torch.Tensor,
     rotations: torch.Tensor,
     num_views: int,
@@ -318,6 +361,7 @@ def _call_video_branch_block(
     return block(
         x,
         context,
+        context_attention_bias,
         t_mod,
         rotations,
         num_views,
@@ -334,6 +378,7 @@ class AcceleratedVideoBranchWanModel(WanModel):
     _video_branch_cached_grid_size: tuple[int, int, int]
     _video_branch_compiled_block: Callable | None
     _video_branch_compiled_signatures: set[tuple]
+    _video_branch_checkpoint_group_size: int
 
     def _build_rotations(
         self,
@@ -407,14 +452,64 @@ class AcceleratedVideoBranchWanModel(WanModel):
                     block_call,
                     block,
                     *inputs,
-                    use_reentrant=False,
+                    use_reentrant=self._video_branch_checkpoint_use_reentrant,
                 )
         return block_call(block, *inputs)
+
+    def _run_block_group(
+        self,
+        blocks: Sequence[AcceleratedVideoBranchDiTBlock],
+        *inputs,
+        use_gradient_checkpointing_offload: bool,
+    ) -> torch.Tensor:
+        """Checkpoint several consecutive blocks as one recompute segment.
+
+        Reentrant checkpointing saves every tensor argument at each checkpoint
+        boundary.  At production resolution the hidden-state boundary alone is
+        close to a GiB for a two-clip, three-view batch.  One boundary per
+        group instead of one per block therefore removes most of the resident
+        checkpoint inputs without changing the executed block graph.
+        """
+        if not blocks:
+            raise ValueError("A checkpoint block group must not be empty")
+        block_call = (
+            self._video_branch_compiled_block
+            if self.training and self._video_branch_compiled_block is not None
+            else _call_video_branch_block
+        )
+        if self._video_branch_requires_compile_warmup:
+            signature = self._compile_signature(*inputs)
+            if signature not in self._video_branch_compiled_signatures:
+                warmup_output = block_call(blocks[0], *inputs)
+                del warmup_output
+                self._video_branch_compiled_signatures.add(signature)
+
+        def group_call(*group_inputs):
+            hidden = group_inputs[0]
+            shared_inputs = group_inputs[1:]
+            for block in blocks:
+                hidden = block_call(block, hidden, *shared_inputs)
+            return hidden
+
+        context = (
+            torch.autograd.graph.save_on_cpu(
+                pin_memory=self._video_branch_checkpoint_offload_pin_memory
+            )
+            if use_gradient_checkpointing_offload
+            else nullcontext()
+        )
+        with context:
+            return checkpoint(
+                group_call,
+                *inputs,
+                use_reentrant=self._video_branch_checkpoint_use_reentrant,
+            )
 
     @staticmethod
     def _compile_signature(
         x: torch.Tensor,
         context: torch.Tensor,
+        context_attention_bias: torch.Tensor | None,
         t_mod: torch.Tensor,
         rotations: torch.Tensor,
         num_views: int,
@@ -427,6 +522,11 @@ class AcceleratedVideoBranchWanModel(WanModel):
         return (
             tuple(x.shape),
             tuple(context.shape),
+            (
+                None
+                if context_attention_bias is None
+                else tuple(context_attention_bias.shape)
+            ),
             int(num_views),
             tuple(grid_size),
             None if view_mask is None else tuple(view_mask.shape),
@@ -448,6 +548,7 @@ class AcceleratedVideoBranchWanModel(WanModel):
         camera_pose_encoding: torch.Tensor | None = None,
         num_views: int | None = None,
         view_mask: torch.Tensor | None = None,
+        context_attention_bias: torch.Tensor | None = None,
         output_layers: List[int] | None = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -466,11 +567,6 @@ class AcceleratedVideoBranchWanModel(WanModel):
         del camera_pose_encoding, kwargs
         num_views = int(num_views)
 
-        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
-        t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
-        if not hasattr(self, "replace_textemb") or not self.replace_textemb:
-            context = self.text_embedding(context)
-
         x, grid_size = self.patchify(x)
         num_frames, height, width = (int(value) for value in grid_size)
         grid_size = (num_frames, height, width)
@@ -479,6 +575,34 @@ class AcceleratedVideoBranchWanModel(WanModel):
                 f"Flattened video batch {x.shape[0]} is not divisible by V={num_views}"
             )
         batch_size = x.shape[0] // num_views
+        flattened_batch_size = batch_size * num_views
+        if timestep.ndim != 1 or timestep.shape[0] not in {
+            batch_size,
+            flattened_batch_size,
+        }:
+            raise ValueError(
+                "timestep must have shape (B,) or (B*V,), got "
+                f"{tuple(timestep.shape)} for B={batch_size}, V={num_views}"
+            )
+        if context.ndim != 3 or context.shape[0] not in {
+            batch_size,
+            flattened_batch_size,
+        }:
+            raise ValueError(
+                "context must have shape (B, S, D) or (B*V, S, D), got "
+                f"{tuple(context.shape)} for B={batch_size}, V={num_views}"
+            )
+        if context_attention_bias is not None and (
+            context_attention_bias.ndim != 2
+            or context_attention_bias.shape[0]
+            not in {batch_size, flattened_batch_size}
+            or context_attention_bias.shape[1] != context.shape[1]
+        ):
+            raise ValueError(
+                "context_attention_bias must have shape (B, S) or (B*V, S); "
+                f"got {tuple(context_attention_bias.shape)} for B={batch_size}, "
+                f"V={num_views}, S={context.shape[1]}"
+            )
         if view_mask is not None and view_mask.shape != (batch_size, num_views):
             raise ValueError(
                 f"view_mask must have shape {(batch_size, num_views)}, "
@@ -490,26 +614,61 @@ class AcceleratedVideoBranchWanModel(WanModel):
                 f"got {tuple(plucker_fea.shape[:2])}"
             )
 
+        t_condition = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, timestep)
+        )
+        if timestep.shape[0] == batch_size:
+            t_view = t_condition
+            t = repeat(t_condition, "b d -> (b v) d", v=num_views)
+            t_mod = self.time_projection(t_condition).unflatten(
+                1, (6, self.dim)
+            )
+            t_mod = repeat(t_mod, "b n d -> (b v) n d", v=num_views)
+        else:
+            t = t_condition
+            t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+            t_view = rearrange(t, "(b v) d -> b v d", v=num_views)[:, 0]
+
+        if not hasattr(self, "replace_textemb") or not self.replace_textemb:
+            context = self.text_embedding(context)
+
         rotations = self._rotations_for_grid(grid_size, x.device)
-        t_view = rearrange(t, "(b v) d -> b v d", v=num_views)[:, 0]
         t_view = repeat(t_view, "b d -> (b f) d", f=num_frames)
         t_mod_view = self.time_projection_view(t_view).unflatten(1, (3, self.dim))
 
-        for block in self.blocks:
-            x = self._run_block(
-                block,
-                x,
-                context,
-                t_mod,
-                rotations,
-                num_views,
-                grid_size,
-                t_mod_view,
-                view_mask,
-                plucker_fea,
-                use_gradient_checkpointing=use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-            )
+        shared_block_inputs = (
+            context,
+            context_attention_bias,
+            t_mod,
+            rotations,
+            num_views,
+            grid_size,
+            t_mod_view,
+            view_mask,
+            plucker_fea,
+        )
+        group_size = self._video_branch_checkpoint_group_size
+        if self.training and use_gradient_checkpointing and group_size > 1:
+            for start in range(0, len(self.blocks), group_size):
+                x = self._run_block_group(
+                    tuple(self.blocks[start : start + group_size]),
+                    x,
+                    *shared_block_inputs,
+                    use_gradient_checkpointing_offload=(
+                        use_gradient_checkpointing_offload
+                    ),
+                )
+        else:
+            for block in self.blocks:
+                x = self._run_block(
+                    block,
+                    x,
+                    *shared_block_inputs,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
+                    use_gradient_checkpointing_offload=(
+                        use_gradient_checkpointing_offload
+                    ),
+                )
 
         x = self.head(x, t)
         return self.unpatchify(x, grid_size)
@@ -544,6 +703,8 @@ def accelerate_video_branch_wan_model(
     rope_chunk_size: int | None = 3600,
     rope_compute_dtype: str = "float64",
     checkpoint_offload_pin_memory: bool = False,
+    checkpoint_use_reentrant: bool = False,
+    checkpoint_block_group_size: int = 1,
     compile_enabled: bool = False,
     compile_backend: str = "inductor",
     compile_mode: str = "default",
@@ -574,6 +735,12 @@ def accelerate_video_branch_wan_model(
     ffn_chunk_size = _positive_chunk_size(ffn_chunk_size, "ffn_chunk_size")
     camera_chunk_size = _positive_chunk_size(camera_chunk_size, "camera_chunk_size")
     rope_chunk_size = _positive_chunk_size(rope_chunk_size, "rope_chunk_size")
+    checkpoint_block_group_size = int(checkpoint_block_group_size)
+    if checkpoint_block_group_size <= 0:
+        raise ValueError(
+            "checkpoint_block_group_size must be positive, got "
+            f"{checkpoint_block_group_size}"
+        )
     for block in dit.blocks:
         block.__class__ = AcceleratedVideoBranchDiTBlock
         block._video_branch_ffn_chunk_size = ffn_chunk_size
@@ -587,6 +754,10 @@ def accelerate_video_branch_wan_model(
     dit._video_branch_checkpoint_offload_pin_memory = bool(
         checkpoint_offload_pin_memory
     )
+    dit._video_branch_checkpoint_use_reentrant = bool(checkpoint_use_reentrant)
+    dit._video_branch_checkpoint_group_size = checkpoint_block_group_size
+    dit._video_branch_compact_conditioning = True
+    dit._video_branch_exact_text_padding_compression = True
 
     parameter = next(dit.parameters())
     rotations = dit._build_rotations(*grid_size, device=parameter.device)
